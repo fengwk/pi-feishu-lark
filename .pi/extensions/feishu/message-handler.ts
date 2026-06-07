@@ -99,7 +99,6 @@ export class FeishuMessageHandler {
 
       const prompt = buildPrompt(msg, text, fileSections, imageInputs, skippedImageCount, modelSupportsImage, downloadErrors);
       const status = new TaskStatusCard(key, msg.messageId, transport);
-      await status.start();
       await this.conversations.promptWithImages(key, prompt, imageInputs, async (reply) => {
         await transport.replyText(msg.messageId, reply);
       }, status);

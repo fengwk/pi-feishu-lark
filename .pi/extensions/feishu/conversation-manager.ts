@@ -17,11 +17,17 @@ import type { ResumeScope, ResumeSessionPage } from "./cards.js";
 import type { TaskStatusSink } from "./task-status-card.js";
 import type { FeishuState } from "./types.js";
 
+type ReplyTarget = (text: string) => Promise<void>;
 type ActiveRun = {
   session: AgentSession;
   runId?: string;
   stopped: boolean;
   status?: TaskStatusSink;
+  fallbackReply: ReplyTarget;
+  replyTargets: ReplyTarget[];
+  currentTurnReplyTargets: ReplyTarget[];
+  assistantReplyCount: number;
+  assistantReplies: Promise<void>[];
 };
 
 export type StopConversationResult =
@@ -31,10 +37,12 @@ export type StopConversationResult =
   | { status: "failed"; message: string };
 
 const RESUME_PAGE_SIZE = 10;
+const PROMPT_TIMEOUT_MS = 60 * 60 * 1000;
 
 export class ConversationManager {
   private readonly sessions = new Map<string, Promise<AgentSession>>();
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly startingRuns = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly authStorage = AuthStorage.create();
   private readonly modelRegistry = ModelRegistry.create(this.authStorage);
@@ -78,42 +86,110 @@ export class ConversationManager {
     onReply: (text: string) => Promise<void>,
     status?: TaskStatusSink,
   ) {
-    const previous = this.previousTurn(key);
-    const next = previous.then(async () => {
-      debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
-      const session = await this.getSession(key);
-      const run: ActiveRun = { session, runId: status?.runId, stopped: false, status };
-      this.activeRuns.set(key, run);
-      this.bridge?.beginFeishuInput(session.sessionId);
-      try {
-        try {
-          await withTimeout(
-            session.prompt(userText, images.length ? { images } : undefined),
-            180_000,
-            "Pi 模型处理超时，请稍后重试；如果是图片消息，可以先切换到明确支持图片的模型。",
-          );
-        } catch (error) {
-          if (run.stopped) {
-            debugLog("feishu.prompt.stopped", { key });
-            return;
-          }
-          throw error;
-        }
-      } finally {
-        if (this.activeRuns.get(key) === run) this.activeRuns.delete(key);
-        this.bridge?.endFeishuInput(session.sessionId);
+    const active = this.activeRuns.get(key);
+    if (active?.session.isStreaming) {
+      await this.queueSteering(key, active, userText, images, onReply);
+      return;
+    }
+
+    const starting = this.startingRuns.get(key);
+    if (starting) {
+      await starting.catch(() => undefined);
+      const startedActive = this.activeRuns.get(key);
+      if (startedActive?.session.isStreaming) {
+        await this.queueSteering(key, startedActive, userText, images, onReply);
+        return;
       }
-      if (run.stopped) return;
-      const answer = extractLastAssistantText(session);
-      debugLog("feishu.prompt.done", { key, answerLength: answer.length });
-      await onReply(answer || "No response.");
-      await status?.finish("done");
-    }).catch(async (error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      debugLog("feishu.prompt.error", { key, error: message });
-      await status?.finish("failed", message);
-      await onReply(`Pi error: ${message}`);
+    }
+
+    const previous = this.queues.get(key);
+    if (previous) {
+      await previous.catch((error) => {
+        debugLog("feishu.queue.previous_error", {
+          key,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      const queuedActive = this.activeRuns.get(key);
+      if (queuedActive?.session.isStreaming) {
+        await this.queueSteering(key, queuedActive, userText, images, onReply);
+        return;
+      }
+    }
+
+    let resolveStarted: () => void = () => undefined;
+    let startedResolved = false;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
     });
+    const finishStarting = () => {
+      if (!startedResolved) {
+        startedResolved = true;
+        resolveStarted();
+      }
+      if (this.startingRuns.get(key) === started) this.startingRuns.delete(key);
+    };
+    this.startingRuns.set(key, started);
+
+    const next = (async () => {
+      let run: ActiveRun | undefined;
+      try {
+        debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
+        const session = await this.getFreshSessionForPrompt(key);
+        run = {
+          session,
+          runId: status?.runId,
+          stopped: false,
+          status,
+          fallbackReply: onReply,
+          replyTargets: [onReply],
+          currentTurnReplyTargets: [],
+          assistantReplyCount: 0,
+          assistantReplies: [],
+        };
+        this.activeRuns.set(key, run);
+        finishStarting();
+        await status?.start();
+        if (run.stopped) return;
+        this.bridge?.beginFeishuInput(session.sessionId);
+        try {
+          try {
+            await withTimeout(
+              session.prompt(userText, images.length ? { images } : undefined),
+              PROMPT_TIMEOUT_MS,
+              "Pi 模型处理超时，请稍后重试；如果是图片消息，可以先切换到明确支持图片的模型。",
+            );
+          } catch (error) {
+            if (run.stopped) {
+              debugLog("feishu.prompt.stopped", { key });
+              return;
+            }
+            throw error;
+          }
+        } finally {
+          if (this.activeRuns.get(key) === run) this.activeRuns.delete(key);
+          this.bridge?.endFeishuInput(session.sessionId);
+        }
+        if (run.stopped) return;
+        if (run.assistantReplyCount === 0) {
+          const answer = extractLastAssistantText(session);
+          debugLog("feishu.prompt.done", { key, answerLength: answer.length, source: "fallback" });
+          await run.fallbackReply(answer || "No response.");
+        } else {
+          debugLog("feishu.prompt.done", { key, replyCount: run.assistantReplyCount, source: "turn_end" });
+        }
+        if (run.assistantReplies.length) await Promise.allSettled(run.assistantReplies);
+        await status?.finish("done");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        debugLog("feishu.prompt.error", { key, error: message });
+        await status?.finish("failed", message);
+        await onReply(`Pi error: ${message}`);
+      } finally {
+        finishStarting();
+        if (run && this.activeRuns.get(key) === run) this.activeRuns.delete(key);
+      }
+    })();
     this.queues.set(key, next);
     await next;
   }
@@ -337,6 +413,7 @@ export class ConversationManager {
     }
     this.sessions.clear();
     this.queues.clear();
+    this.startingRuns.clear();
     this.state = { sessions: {}, models: {}, workspaces: {} };
   }
 
@@ -348,15 +425,80 @@ export class ConversationManager {
     return created;
   }
 
+  private async getFreshSessionForPrompt(key: string): Promise<AgentSession> {
+    const cached = this.sessions.get(key);
+    if (cached) {
+      try { (await cached).dispose(); } catch {}
+      this.sessions.delete(key);
+    }
+    return this.getSession(key);
+  }
+
+  private async queueSteering(
+    key: string,
+    active: ActiveRun,
+    userText: string,
+    images: Array<{ type: "image"; data: string; mimeType: string }>,
+    onReply: (text: string) => Promise<void>,
+  ) {
+    if (active.stopped) {
+      await onReply("当前任务正在停止，请稍后重试。");
+      return;
+    }
+
+    const targetIndex = active.replyTargets.length;
+    active.replyTargets.push(onReply);
+    try {
+      await active.session.steer(userText, images.length ? images : undefined);
+    } catch (error) {
+      active.replyTargets.splice(targetIndex, 1);
+      const message = error instanceof Error ? error.message : String(error);
+      debugLog("feishu.prompt.steering_error", { key, error: message });
+      await onReply(`Pi error: ${message}`);
+      return;
+    }
+    debugLog("feishu.prompt.steering_queued", { key, textLength: userText.length, imageCount: images.length });
+    await onReply("已追加到当前任务队列");
+  }
+
+  private captureUserTurnReplyTarget(key: string) {
+    const active = this.activeRuns.get(key);
+    if (!active || active.stopped) return;
+    const target = active.replyTargets.shift();
+    if (target) active.currentTurnReplyTargets.push(target);
+  }
+
+  private deliverAssistantTurnResult(key: string, message: any, _toolResults: unknown) {
+    const active = this.activeRuns.get(key);
+    if (!active || active.stopped) return;
+    if (!isAssistantAnswerMessage(message)) return;
+
+    const answer = extractAssistantText(message);
+    if (!answer) return;
+
+    const target = active.currentTurnReplyTargets[0] || active.replyTargets.shift() || active.fallbackReply;
+    active.currentTurnReplyTargets = [];
+    active.assistantReplyCount += 1;
+    const sequence = active.assistantReplyCount;
+    debugLog("feishu.prompt.turn_result", { key, sequence, answerLength: answer.length });
+    const reply = target(answer).catch((error) => {
+      debugLog("feishu.prompt.turn_reply_error", {
+        key,
+        sequence,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    active.assistantReplies.push(reply);
+  }
+
   private previousTurn(key: string) {
     const previous = this.queues.get(key) || Promise.resolve();
-    return withTimeout(previous, 120_000, "上一条飞书消息处理超时，已跳过等待。")
-      .catch((error) => {
-        debugLog("feishu.queue.previous_timeout", {
-          key,
-          error: error instanceof Error ? error.message : String(error),
-        });
+    return previous.catch((error) => {
+      debugLog("feishu.queue.previous_error", {
+        key,
+        error: error instanceof Error ? error.message : String(error),
       });
+    });
   }
 
   private async createSession(key: string): Promise<AgentSession> {
@@ -403,6 +545,10 @@ export class ConversationManager {
       this.activeRuns.get(key)?.status?.updateFromEvent(event);
       if (event.type === "message_end") {
         this.bridge?.handleMessageEnd(session.sessionId, key, event.message);
+        if ((event.message as any)?.role === "user") this.captureUserTurnReplyTarget(key);
+      }
+      if (event.type === "turn_end") {
+        this.deliverAssistantTurnResult(key, (event as any).message, (event as any).toolResults);
       }
     });
 
@@ -472,15 +618,29 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
 function extractLastAssistantText(session: AgentSession): string {
   const messages = [...(session.messages || [])].reverse();
   for (const msg of messages as any[]) {
-    if (msg.role !== "assistant") continue;
-    const content = msg.content;
-    if (typeof content === "string") return content.trim();
-    if (Array.isArray(content)) {
-      return content
-        .map((p) => p?.type === "text" ? p.text : "")
-        .join("")
-        .trim();
-    }
+    if (!isAssistantAnswerMessage(msg)) continue;
+    const text = extractAssistantText(msg);
+    if (text) return text;
+  }
+  return "";
+}
+
+function isAssistantAnswerMessage(msg: any): boolean {
+  if (msg?.role !== "assistant") return false;
+  if (msg.stopReason === "error" || msg.stopReason === "aborted" || msg.stopReason === "toolUse") return false;
+  if (!Array.isArray(msg.content)) return typeof msg.content === "string";
+  return !msg.content.some((p) => p?.type === "toolCall");
+}
+function extractAssistantText(msg: any): string {
+  if (msg?.role !== "assistant") return "";
+  if (msg.stopReason === "error" || msg.stopReason === "aborted") return "";
+  const content = msg.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => p?.type === "text" ? p.text : "")
+      .join("")
+      .trim();
   }
   return "";
 }

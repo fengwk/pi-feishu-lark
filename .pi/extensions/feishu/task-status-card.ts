@@ -5,6 +5,7 @@ export type TaskStatus = "running" | "done" | "failed" | "stopped" | "inactive";
 
 export type TaskStatusSink = {
   readonly runId: string;
+  start(): Promise<void>;
   updateFromEvent(event: unknown): void;
   stopImmediately(phase?: string): Promise<void>;
   finish(status: Exclude<TaskStatus, "running" | "inactive">, phase?: string): Promise<void>;
@@ -33,6 +34,7 @@ export class TaskStatusCard implements TaskStatusSink {
   private runningUpdateInFlight = false;
   private patchQueue: Promise<void> = Promise.resolve();
   private version = 0;
+  private startedAt = Date.now();
 
   constructor(
     private readonly key: string,
@@ -41,6 +43,7 @@ export class TaskStatusCard implements TaskStatusSink {
   ) {}
 
   async start() {
+    this.startedAt = Date.now();
     try {
       this.cardMessageId = await this.transport.replyCard(
         this.replyToMessageId,
@@ -81,7 +84,7 @@ export class TaskStatusCard implements TaskStatusSink {
     this.stopHeartbeat();
     this.clearPendingRunningUpdate();
     const finalPhase = phase ? normalizePhase(phase) : defaultFinalPhase(status);
-    await this.patch(buildTaskStatusCard({ key: this.key, runId: this.runId, status, phase: finalPhase }), { final: true, force });
+    await this.patch(buildTaskStatusCard({ key: this.key, runId: this.runId, status, phase: finalPhase, durationMs: Date.now() - this.startedAt }), { final: true, force });
   }
 
   private updateRunningPhase(phase: string) {
@@ -199,8 +202,15 @@ export class TaskStatusCard implements TaskStatusSink {
   }
 }
 
-export function buildTaskStatusCard(input: { key: string; status: TaskStatus; phase?: string; runId?: string }) {
+export function buildTaskStatusCard(input: { key: string; status: TaskStatus; phase?: string; runId?: string; durationMs?: number }) {
   const running = input.status === "running";
+  const phase = normalizePhase(input.phase || defaultDisplayPhase(input.status));
+  const lines = [
+    `**状态：** ${statusLabel(input.status)}`,
+    `${running ? "**当前阶段：**" : "**结果：**"} ${phase}`,
+    ...(input.durationMs === undefined ? [] : [`**耗时：** ${formatDuration(input.durationMs)}`]),
+  ];
+
   return {
     config: {
       wide_screen_mode: true,
@@ -211,13 +221,13 @@ export function buildTaskStatusCard(input: { key: string; status: TaskStatus; ph
       title: { tag: "plain_text", content: titleForStatus(input.status) },
     },
     elements: [
-      ...(input.phase ? [{
+      {
         tag: "div",
         text: {
           tag: "lark_md",
-          content: `当前阶段：${normalizePhase(input.phase)}`,
+          content: lines.join("\n"),
         },
-      }] : []),
+      },
       ...(running ? [{
         tag: "action",
         actions: [{
@@ -246,41 +256,55 @@ export function describePiEvent(event: unknown): string | undefined {
   const raw = event as any;
   switch (raw.type) {
     case "agent_start":
-      return "agent_start";
+      return "正在启动任务";
     case "turn_start":
-      return typeof raw.turnIndex === "number" ? `turn_start: ${raw.turnIndex + 1}` : "turn_start";
+      return "正在思考";
     case "message_start":
-      return raw.message?.role ? `message_start: ${raw.message.role}` : "message_start";
+      return describeMessageStart(raw.message?.role);
     case "message_update":
       return describeAssistantEvent(raw.assistantMessageEvent);
     case "tool_execution_start":
-      return withBriefJson(`tool_execution_start: ${raw.toolName || "tool"}`, raw.args);
+      return `正在执行工具：${raw.toolName || "tool"}`;
     case "tool_execution_end":
-      return `tool_execution_end: ${raw.toolName || "tool"} ${raw.isError ? "error" : "done"}`;
+      return raw.isError
+        ? `工具执行失败：${raw.toolName || "tool"}`
+        : `工具执行完成：${raw.toolName || "tool"}`;
     case "compaction_start":
-      return raw.reason ? `compaction_start: ${raw.reason}` : "compaction_start";
+      return "正在压缩上下文";
     case "auto_retry_start":
-      return typeof raw.attempt === "number" ? `auto_retry_start: ${raw.attempt}/${raw.maxAttempts || "?"}` : "auto_retry_start";
+      return typeof raw.attempt === "number"
+        ? `请求失败，正在重试（${raw.attempt}/${raw.maxAttempts || "?"}）`
+        : "请求失败，正在重试";
     case "auto_retry_end":
-      return raw.success === false ? "auto_retry_end: failed" : "auto_retry_end";
+      return raw.success === false ? "重试失败" : "重试完成";
+    case "agent_end":
+      return "正在收尾";
     default:
       return undefined;
   }
 }
 
-function describeAssistantEvent(event: any) {
-  if (!event?.type) return "message_update";
-  if (event.type === "toolcall_end" && event.toolCall?.name) return `toolcall_end: ${event.toolCall.name}`;
-  if (event.type === "done" && event.reason) return `message_update: done ${event.reason}`;
-  if (event.type === "error" && event.reason) return `message_update: error ${event.reason}`;
-  if (event.type.endsWith("_delta")) return undefined;
-  return `message_update: ${event.type}`;
+function describeMessageStart(role?: string) {
+  if (role === "user") return "已收到新的输入";
+  if (role === "assistant") return "正在生成回复";
+  if (role === "tool") return "正在读取工具结果";
+  return "正在处理消息";
 }
 
-function withBriefJson(prefix: string, value: unknown) {
-  if (value === undefined || value === null) return prefix;
-  return normalizePhase(`${prefix} ${JSON.stringify(value)}`);
+function describeAssistantEvent(event: any) {
+  if (!event?.type) return "正在生成回复";
+  if (event.type === "toolcall_end" && event.toolCall?.name) return `准备调用工具：${event.toolCall.name}`;
+  if (event.type === "done") {
+    if (event.reason === "toolUse") return "正在准备工具调用";
+    if (event.reason === "error") return "模型响应异常";
+    if (event.reason === "aborted") return "响应已中止";
+    return "正在收尾";
+  }
+  if (event.type === "error") return event.reason ? `模型响应异常：${event.reason}` : "模型响应异常";
+  if (event.type.endsWith("_delta")) return undefined;
+  return "正在生成回复";
 }
+
 
 function normalizePhase(text: string) {
   const compact = text.replace(/\s+/g, " ").trim();
@@ -304,10 +328,35 @@ function headerTemplate(status: TaskStatus) {
   return "blue";
 }
 
-function defaultFinalPhase(status: Exclude<TaskStatus, "running" | "inactive">): string | undefined {
-  if (status === "done") return undefined;
+function statusLabel(status: TaskStatus) {
+  if (status === "done") return "已完成";
+  if (status === "failed") return "失败";
+  if (status === "stopped") return "已停止";
+  if (status === "inactive") return "已结束";
+  return "处理中";
+}
+
+function defaultDisplayPhase(status: TaskStatus): string {
+  if (status === "done") return "处理完成";
   if (status === "failed") return "处理失败";
-  return "用户已停止任务";
+  if (status === "stopped") return "用户已停止任务";
+  if (status === "inactive") return "任务已结束";
+  return "正在启动任务";
+}
+
+function defaultFinalPhase(status: Exclude<TaskStatus, "running" | "inactive">): string {
+  return defaultDisplayPhase(status);
+}
+
+function formatDuration(ms: number) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes ? `${hours} 小时 ${restMinutes} 分钟` : `${hours} 小时`;
 }
 
 function sleep(ms: number) {
