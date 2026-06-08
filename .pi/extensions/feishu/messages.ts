@@ -4,6 +4,7 @@ export type BotCommand =
   | { name: "new" }
   | { name: "resume" }
   | { name: "model" }
+  | { name: "thinking"; level?: string }
   | { name: "stop" }
   | { name: "workspace"; path?: string };
 
@@ -85,6 +86,10 @@ export function parseBotCommand(text: string): BotCommand | undefined {
   if (normalized === "/new") return { name: "new" };
   if (normalized === "/resume") return { name: "resume" };
   if (normalized === "/model") return { name: "model" };
+  const thinkingMatch = trimmed.match(/^\/thinking(?:\s+(\S+))?\s*$/);
+  if (thinkingMatch) {
+    return { name: "thinking", level: thinkingMatch[1]?.trim() };
+  }
   if (normalized === "/stop") return { name: "stop" };
   const workspaceMatch = trimmed.match(/^\/workspace(?:\s+(.+))?$/s);
   if (workspaceMatch) {

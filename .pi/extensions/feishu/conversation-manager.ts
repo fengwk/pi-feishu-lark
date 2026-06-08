@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { AgentSession, SessionInfo } from "@earendil-works/pi-coding-agent";
@@ -9,10 +9,12 @@ import {
   getAgentDir,
   ModelRegistry,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { FeishuBridgeRuntime } from "./bridge-runtime.js";
 import { CHILD_SESSION_ENV, ensureRoot, readJson, STATE_PATH, writeJson } from "./config.js";
 import { debugLog } from "./debug.js";
+import { clampThinkingLevel, getSupportedThinkingLevels, isThinkingLevel, resolveEnabledModelScope, type ThinkingLevel } from "./model-preferences.js";
 import type { ResumeScope, ResumeSessionPage } from "./cards.js";
 import type { TaskStatusSink } from "./task-status-card.js";
 import type { FeishuState } from "./types.js";
@@ -46,8 +48,6 @@ export class ConversationManager {
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly authStorage = AuthStorage.create();
   private readonly modelRegistry = ModelRegistry.create(this.authStorage);
-  private defaultProvider: string | undefined;
-  private defaultModelId: string | undefined;
   private state: FeishuState;
 
   constructor(
@@ -58,22 +58,23 @@ export class ConversationManager {
     this.state = readJson<FeishuState>(STATE_PATH, { sessions: {} });
     this.state.sessions ||= {};
     this.state.models ||= {};
+    this.state.thinking ||= {};
     this.state.workspaces ||= {};
-    this.loadSettingsDefault();
+  }
+  private getSettingsManager(workspaceCwd: string) {
+    return SettingsManager.create(workspaceCwd, getAgentDir());
   }
 
-  /** Read global settings default model for fallback in getSelectedModel. */
-  private loadSettingsDefault() {
-    try {
-      const settingsPath = join(getAgentDir(), "settings.json");
-      const raw = readFileSync(settingsPath, "utf-8");
-      const settings = JSON.parse(raw);
-      if (settings.defaultProvider && settings.defaultModel) {
-        this.defaultProvider = settings.defaultProvider;
-        this.defaultModelId = settings.defaultModel;
-      }
-    } catch {}
+  private getAvailableModelChoices(key: string) {
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    return resolveEnabledModelScope(settings.getEnabledModels(), this.modelRegistry.getAvailable());
   }
+
+  private getSavedThinkingLevel(key: string): ThinkingLevel | undefined {
+    const level = this.state.thinking?.[key];
+    return typeof level === "string" && isThinkingLevel(level) ? level : undefined;
+  }
+
 
   async prompt(key: string, userText: string, onReply: (text: string) => Promise<void>) {
     return this.promptWithImages(key, userText, [], onReply);
@@ -322,8 +323,8 @@ export class ConversationManager {
   async selectModel(key: string, provider: string, modelId: string, onReply: (text: string) => Promise<void>) {
     const previous = this.previousTurn(key);
     const next = previous.then(async () => {
-      const model = this.modelRegistry.find(provider, modelId);
-      if (!model || !this.modelRegistry.hasConfiguredAuth(model)) {
+      const model = this.getAvailableModelChoices(key).find((item) => item.model.provider === provider && item.model.id === modelId)?.model;
+      if (!model) {
         await onReply(`这个模型当前不可用：${provider}/${modelId}。请发送 /model 重新选择。`);
         return;
       }
@@ -337,6 +338,37 @@ export class ConversationManager {
       }
       this.sessions.delete(key);
       await onReply(`已切换到 ${provider}/${modelId}。当前飞书会话后续都会使用这个模型。`);
+    }).catch(async (error) => {
+      await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    this.queues.set(key, next);
+    await next;
+  }
+
+  async selectThinkingLevel(key: string, level: ThinkingLevel, onReply: (text: string) => Promise<void>) {
+    const previous = this.previousTurn(key);
+    const next = previous.then(async () => {
+      const currentModel = await this.getSelectedModel(key);
+      if (!currentModel) {
+        await onReply("当前没有可用模型。请先在 Pi 里完成模型登录或 API Key 配置。");
+        return;
+      }
+
+      const availableLevels = await this.getAvailableThinkingLevels(key);
+      if (!availableLevels.includes(level)) {
+        await onReply(`当前模型仅支持这些思考强度：${availableLevels.join("、")}。请先切换模型后再设置。`);
+        return;
+      }
+
+      this.state.thinking![key] = level;
+      writeJson(STATE_PATH, this.state);
+
+      const cached = this.sessions.get(key);
+      if (cached) {
+        try { (await cached).dispose(); } catch {}
+      }
+      this.sessions.delete(key);
+      await onReply(`已切换到 ${level} 思考强度。当前飞书会话后续都会使用这个设置。`);
     }).catch(async (error) => {
       await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -378,33 +410,57 @@ export class ConversationManager {
     await next;
   }
 
-  getAvailableModels() {
-    return this.modelRegistry.getAvailable().sort((a, b) => {
+  getAvailableModels(key: string) {
+    return this.getAvailableModelChoices(key).map((item) => item.model).sort((a, b) => {
       const providerCmp = a.provider.localeCompare(b.provider);
       if (providerCmp !== 0) return providerCmp;
       return a.id.localeCompare(b.id);
     });
   }
 
-  getSelectedModel(key: string) {
+  async getSelectedModel(key: string) {
+    const availableChoices = this.getAvailableModelChoices(key);
     const selected = this.state.models?.[key];
     if (selected) {
-      const model = this.modelRegistry.find(selected.provider, selected.id);
-      if (model && this.modelRegistry.hasConfiguredAuth(model)) return model;
+      const selectedModel = availableChoices.find((item) => item.model.provider === selected.provider && item.model.id === selected.id)?.model;
+      if (selectedModel) return selectedModel;
     }
+
     const cached = this.sessions.get(key);
     if (cached) {
-      return cached.then((session) => session.model);
+      return (await cached).model;
     }
-    // Check settings default model before falling back to first available
-    if (this.defaultProvider && this.defaultModelId) {
-      const defaultModel = this.modelRegistry.find(this.defaultProvider, this.defaultModelId);
-      if (defaultModel && this.modelRegistry.hasConfiguredAuth(defaultModel)) {
-        return defaultModel;
-      }
+
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    const defaultProvider = settings.getDefaultProvider();
+    const defaultModelId = settings.getDefaultModel();
+    if (defaultProvider && defaultModelId) {
+      const defaultModel = availableChoices.find((item) => item.model.provider === defaultProvider && item.model.id === defaultModelId)?.model;
+      if (defaultModel) return defaultModel;
     }
-    const available = this.getAvailableModels();
-    return available[0];
+
+    return availableChoices[0]?.model;
+  }
+
+  async getAvailableThinkingLevels(key: string): Promise<ThinkingLevel[]> {
+    return getSupportedThinkingLevels(await this.getSelectedModel(key));
+  }
+
+  async getSelectedThinkingLevel(key: string): Promise<ThinkingLevel> {
+    const selected = this.getSavedThinkingLevel(key);
+    const currentModel = await this.getSelectedModel(key);
+    if (selected) {
+      return clampThinkingLevel(currentModel, selected);
+    }
+
+    const cached = this.sessions.get(key);
+    if (cached) {
+      return (await cached).thinkingLevel as ThinkingLevel;
+    }
+
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    const fallback = (settings.getDefaultThinkingLevel() || "medium") as ThinkingLevel;
+    return clampThinkingLevel(currentModel, fallback);
   }
 
   resetMemory() {
@@ -414,7 +470,7 @@ export class ConversationManager {
     this.sessions.clear();
     this.queues.clear();
     this.startingRuns.clear();
-    this.state = { sessions: {}, models: {}, workspaces: {} };
+    this.state = { sessions: {}, models: {}, thinking: {}, workspaces: {} };
   }
 
   private getSession(key: string): Promise<AgentSession> {
@@ -505,8 +561,20 @@ export class ConversationManager {
     const workspaceCwd = this.getWorkspace(key);
     ensureWorkspaceExists(workspaceCwd);
     const existingFile = this.state.sessions[key];
+    const settingsManager = this.getSettingsManager(workspaceCwd);
+    const enabledModels = settingsManager.getEnabledModels();
+    const scopedModels = this.getAvailableModelChoices(key);
     const selected = this.state.models?.[key];
-    const model = selected ? this.modelRegistry.find(selected.provider, selected.id) : undefined;
+    let model = selected
+      ? scopedModels.find((item) => item.model.provider === selected.provider && item.model.id === selected.id)?.model
+      : undefined;
+    if (!model && enabledModels?.length) {
+      const defaultProvider = settingsManager.getDefaultProvider();
+      const defaultModelId = settingsManager.getDefaultModel();
+      model = scopedModels.find((item) => item.model.provider === defaultProvider && item.model.id === defaultModelId)?.model
+        || scopedModels[0]?.model;
+    }
+    const thinkingLevel = this.getSavedThinkingLevel(key);
     const sessionManager = existingFile && existsSync(existingFile)
       ? SessionManager.open(existingFile, undefined, workspaceCwd)
       : SessionManager.create(workspaceCwd);
@@ -514,6 +582,7 @@ export class ConversationManager {
     const loader = new DefaultResourceLoader({
       cwd: workspaceCwd,
       agentDir: getAgentDir(),
+      settingsManager,
       systemPromptOverride: (base) => {
         const extra = "You are replying through Feishu/Lark. Keep answers concise and readable in chat. Do not use markdown tables.";
         return base?.trim() ? `${base}\n\n${extra}` : extra;
@@ -535,7 +604,10 @@ export class ConversationManager {
       authStorage: this.authStorage,
       modelRegistry: this.modelRegistry,
       model,
+      thinkingLevel,
+      scopedModels,
       sessionManager,
+      settingsManager,
       resourceLoader: loader,
     });
 
