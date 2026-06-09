@@ -197,12 +197,8 @@ export class FeishuTransport {
     return result;
   }
 
-  private async handleCardActionAction(action: FeishuCardAction, mode: "ws" | "webhook") {
-    const result = await this.onCardAction(action);
-    if (mode === "ws" && result) {
-      await this.updateCard(action.messageId, result);
-    }
-    return result;
+  private async handleCardActionAction(action: FeishuCardAction, _mode: "ws" | "webhook") {
+    return await this.onCardAction(action);
   }
 
   private cardActionMode() {

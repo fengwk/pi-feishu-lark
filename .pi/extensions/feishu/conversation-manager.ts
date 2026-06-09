@@ -137,6 +137,9 @@ export class ConversationManager {
       try {
         debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
         const session = await this.getFreshSessionForPrompt(key);
+        const baselineMessageCount = Array.isArray(session.messages) ? session.messages.length : 0;
+        let finalStatus: "done" | "failed" = "done";
+        let finalPhase: string | undefined;
         run = {
           session,
           runId: status?.runId,
@@ -173,14 +176,40 @@ export class ConversationManager {
         }
         if (run.stopped) return;
         if (run.assistantReplyCount === 0) {
-          const answer = extractLastAssistantText(session);
-          debugLog("feishu.prompt.done", { key, answerLength: answer.length, source: "fallback" });
-          await run.fallbackReply(answer || "No response.");
+          const answer = extractAssistantTextSince(session, baselineMessageCount);
+          if (answer) {
+            debugLog("feishu.prompt.done", { key, answerLength: answer.length, source: "fallback_current_turn" });
+            await run.fallbackReply(answer);
+          } else {
+            const turnError = extractAssistantErrorSince(session, baselineMessageCount);
+            if (turnError) {
+              finalStatus = "failed";
+              finalPhase = turnError;
+              debugLog("feishu.prompt.done_error", {
+                key,
+                source: "fallback_error",
+                error: turnError,
+                baselineMessageCount,
+                totalMessageCount: Array.isArray(session.messages) ? session.messages.length : undefined,
+              });
+              await run.fallbackReply(`Pi error: ${turnError}`);
+            } else {
+              finalStatus = "failed";
+              finalPhase = "未生成最终回复";
+              debugLog("feishu.prompt.done_missing_reply", {
+                key,
+                source: "fallback_missing",
+                baselineMessageCount,
+                totalMessageCount: Array.isArray(session.messages) ? session.messages.length : undefined,
+              });
+              await run.fallbackReply("Pi 本次处理结束，但没有生成可发送的最终回复，请稍后重试。");
+            }
+          }
         } else {
           debugLog("feishu.prompt.done", { key, replyCount: run.assistantReplyCount, source: "turn_end" });
         }
         if (run.assistantReplies.length) await Promise.allSettled(run.assistantReplies);
-        await status?.finish("done");
+        await status?.finish(finalStatus, finalPhase);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         debugLog("feishu.prompt.error", { key, error: message });
@@ -517,16 +546,23 @@ export class ConversationManager {
     await onReply("已追加到当前任务队列");
   }
 
-  private captureUserTurnReplyTarget(key: string) {
+  private getActiveRunForSession(key: string, sessionId: string) {
     const active = this.activeRuns.get(key);
-    if (!active || active.stopped) return;
+    if (!active || active.stopped) return undefined;
+    if (active.session.sessionId !== sessionId) return undefined;
+    return active;
+  }
+
+  private captureUserTurnReplyTarget(key: string, sessionId: string) {
+    const active = this.getActiveRunForSession(key, sessionId);
+    if (!active) return;
     const target = active.replyTargets.shift();
     if (target) active.currentTurnReplyTargets.push(target);
   }
 
-  private deliverAssistantTurnResult(key: string, message: any, _toolResults: unknown) {
-    const active = this.activeRuns.get(key);
-    if (!active || active.stopped) return;
+  private deliverAssistantTurnResult(key: string, sessionId: string, message: any, _toolResults: unknown) {
+    const active = this.getActiveRunForSession(key, sessionId);
+    if (!active) return;
     if (!isAssistantAnswerMessage(message)) return;
 
     const answer = extractAssistantText(message);
@@ -614,13 +650,13 @@ export class ConversationManager {
     await session.bindExtensions({});
     this.bridge?.attachSession(key, session.sessionId);
     session.subscribe((event) => {
-      this.activeRuns.get(key)?.status?.updateFromEvent(event);
+      this.getActiveRunForSession(key, session.sessionId)?.status?.updateFromEvent(event);
       if (event.type === "message_end") {
         this.bridge?.handleMessageEnd(session.sessionId, key, event.message);
-        if ((event.message as any)?.role === "user") this.captureUserTurnReplyTarget(key);
+        if ((event.message as any)?.role === "user") this.captureUserTurnReplyTarget(key, session.sessionId);
       }
       if (event.type === "turn_end") {
-        this.deliverAssistantTurnResult(key, (event as any).message, (event as any).toolResults);
+        this.deliverAssistantTurnResult(key, session.sessionId, (event as any).message, (event as any).toolResults);
       }
     });
 
@@ -687,12 +723,25 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
   }
 }
 
-function extractLastAssistantText(session: AgentSession): string {
-  const messages = [...(session.messages || [])].reverse();
-  for (const msg of messages as any[]) {
+function extractAssistantTextSince(session: AgentSession, startIndex: number): string {
+  const messages = Array.isArray(session.messages)
+    ? session.messages.slice(Math.max(0, startIndex))
+    : [];
+  for (const msg of [...messages].reverse() as any[]) {
     if (!isAssistantAnswerMessage(msg)) continue;
     const text = extractAssistantText(msg);
     if (text) return text;
+  }
+  return "";
+}
+
+function extractAssistantErrorSince(session: AgentSession, startIndex: number): string {
+  const messages = Array.isArray(session.messages)
+    ? session.messages.slice(Math.max(0, startIndex))
+    : [];
+  for (const msg of [...messages].reverse() as any[]) {
+    const error = extractAssistantError(msg);
+    if (error) return error;
   }
   return "";
 }
@@ -715,6 +764,22 @@ function extractAssistantText(msg: any): string {
       .trim();
   }
   return "";
+}
+
+function extractAssistantError(msg: any): string {
+  if (msg?.role !== "assistant") return "";
+  if (typeof msg.errorMessage === "string" && msg.errorMessage.trim()) return msg.errorMessage.trim();
+  if (msg.stopReason !== "error") return "";
+  const content = msg.content;
+  if (typeof content === "string" && content.trim()) return content.trim();
+  if (Array.isArray(content)) {
+    const text = content
+      .map((p) => p?.type === "text" ? p.text : "")
+      .join("")
+      .trim();
+    if (text) return text;
+  }
+  return "模型调用失败";
 }
 
 function resolveWorkspacePath(input: string) {
