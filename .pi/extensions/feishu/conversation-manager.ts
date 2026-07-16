@@ -3,11 +3,10 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { AgentSession, SessionInfo } from "@earendil-works/pi-coding-agent";
 import {
-  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { FeishuBridgeRuntime } from "./bridge-runtime.js";
@@ -44,8 +43,7 @@ export class ConversationManager {
   private readonly queues = new Map<string, Promise<void>>();
   private readonly startingRuns = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, ActiveRun>();
-  private readonly authStorage = AuthStorage.create();
-  private readonly modelRegistry = ModelRegistry.create(this.authStorage);
+  private modelRuntimePromise: Promise<ModelRuntime> | undefined;
   private defaultProvider: string | undefined;
   private defaultModelId: string | undefined;
   private state: FeishuState;
@@ -73,6 +71,14 @@ export class ConversationManager {
         this.defaultModelId = settings.defaultModel;
       }
     } catch {}
+  }
+
+  private getModelRuntime() {
+    this.modelRuntimePromise ||= ModelRuntime.create({
+      authPath: join(getAgentDir(), "auth.json"),
+      modelsPath: join(getAgentDir(), "models.json"),
+    });
+    return this.modelRuntimePromise;
   }
 
   async prompt(key: string, userText: string, onReply: (text: string) => Promise<void>) {
@@ -322,8 +328,9 @@ export class ConversationManager {
   async selectModel(key: string, provider: string, modelId: string, onReply: (text: string) => Promise<void>) {
     const previous = this.previousTurn(key);
     const next = previous.then(async () => {
-      const model = this.modelRegistry.find(provider, modelId);
-      if (!model || !this.modelRegistry.hasConfiguredAuth(model)) {
+      const availableModels = await (await this.getModelRuntime()).getAvailable();
+      const model = availableModels.find((item) => item.provider === provider && item.id === modelId);
+      if (!model) {
         await onReply(`这个模型当前不可用：${provider}/${modelId}。请发送 /model 重新选择。`);
         return;
       }
@@ -378,32 +385,33 @@ export class ConversationManager {
     await next;
   }
 
-  getAvailableModels() {
-    return this.modelRegistry.getAvailable().sort((a, b) => {
+  async getAvailableModels() {
+    const availableModels = await (await this.getModelRuntime()).getAvailable();
+    return [...availableModels].sort((a, b) => {
       const providerCmp = a.provider.localeCompare(b.provider);
       if (providerCmp !== 0) return providerCmp;
       return a.id.localeCompare(b.id);
     });
   }
 
-  getSelectedModel(key: string) {
+  async getSelectedModel(key: string) {
+    const available = await this.getAvailableModels();
     const selected = this.state.models?.[key];
     if (selected) {
-      const model = this.modelRegistry.find(selected.provider, selected.id);
-      if (model && this.modelRegistry.hasConfiguredAuth(model)) return model;
+      const model = available.find((item) => item.provider === selected.provider && item.id === selected.id);
+      if (model) return model;
     }
     const cached = this.sessions.get(key);
     if (cached) {
-      return cached.then((session) => session.model);
+      return (await cached).model;
     }
     // Check settings default model before falling back to first available
     if (this.defaultProvider && this.defaultModelId) {
-      const defaultModel = this.modelRegistry.find(this.defaultProvider, this.defaultModelId);
-      if (defaultModel && this.modelRegistry.hasConfiguredAuth(defaultModel)) {
+      const defaultModel = available.find((item) => item.provider === this.defaultProvider && item.id === this.defaultModelId);
+      if (defaultModel) {
         return defaultModel;
       }
     }
-    const available = this.getAvailableModels();
     return available[0];
   }
 
@@ -505,8 +513,9 @@ export class ConversationManager {
     const workspaceCwd = this.getWorkspace(key);
     ensureWorkspaceExists(workspaceCwd);
     const existingFile = this.state.sessions[key];
+    const modelRuntime = await this.getModelRuntime();
     const selected = this.state.models?.[key];
-    const model = selected ? this.modelRegistry.find(selected.provider, selected.id) : undefined;
+    const model = selected ? modelRuntime.getModel(selected.provider, selected.id) : undefined;
     const sessionManager = existingFile && existsSync(existingFile)
       ? SessionManager.open(existingFile, undefined, workspaceCwd)
       : SessionManager.create(workspaceCwd);
@@ -532,8 +541,7 @@ export class ConversationManager {
     const { session } = await createAgentSession({
       cwd: workspaceCwd,
       agentDir: getAgentDir(),
-      authStorage: this.authStorage,
-      modelRegistry: this.modelRegistry,
+      modelRuntime,
       model,
       sessionManager,
       resourceLoader: loader,
