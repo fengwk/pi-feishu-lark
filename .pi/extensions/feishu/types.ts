@@ -1,3 +1,4 @@
+import type { ThinkingLevel } from "./model-preferences.js";
 export type Domain = "feishu" | "lark";
 export type GroupPolicy = "open" | "mention";
 export type CardActionMode = "webhook" | "ws";
@@ -24,6 +25,7 @@ export type ModelSelection = {
 export type FeishuState = {
   sessions: Record<string, string>;
   models?: Record<string, ModelSelection>;
+  thinking?: Record<string, ThinkingLevel>;
   workspaces?: Record<string, string>;
 };
 

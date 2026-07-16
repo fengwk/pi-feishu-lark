@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { CardActionMode, Domain, FeishuConfig, GroupPolicy } from "./types.js";
+import type { CardActionMode, FeishuConfig } from "./types.js";
 
 export const ROOT_DIR = join(homedir(), ".pi", "agent", "feishu");
 export const CONFIG_PATH = join(ROOT_DIR, "config.json");
@@ -51,23 +51,24 @@ export function removePath(path: string) {
 }
 
 export function loadConfig(): FeishuConfig | undefined {
-  const envAppId = process.env.FEISHU_APP_ID?.trim();
-  const envSecret = process.env.FEISHU_APP_SECRET?.trim();
-  if (envAppId && envSecret) {
-    return {
-      appId: envAppId,
-      appSecret: envSecret,
-      domain: (process.env.FEISHU_DOMAIN as Domain) || DEFAULT_CONFIG.domain,
-      groupPolicy: (process.env.FEISHU_GROUP_POLICY as GroupPolicy) || DEFAULT_CONFIG.groupPolicy,
-      cardActionMode: parseCardActionMode(process.env.FEISHU_CARD_ACTION_MODE) || DEFAULT_CONFIG.cardActionMode,
-      cardActionWebhookHost: process.env.FEISHU_CARD_ACTION_WEBHOOK_HOST?.trim() || DEFAULT_CONFIG.cardActionWebhookHost,
-      cardActionWebhookPort: parsePort(process.env.FEISHU_CARD_ACTION_WEBHOOK_PORT) ?? DEFAULT_CONFIG.cardActionWebhookPort,
-      cardActionWebhookPath: normalizeWebhookPath(process.env.FEISHU_CARD_ACTION_WEBHOOK_PATH) || DEFAULT_CONFIG.cardActionWebhookPath,
-      language: (process.env.FEISHU_LANGUAGE as "zh" | "en") || DEFAULT_CONFIG.language,
-      reactEmoji: process.env.FEISHU_REACT_EMOJI || DEFAULT_CONFIG.reactEmoji,
-      autoStart: process.env.FEISHU_AUTO_START ? process.env.FEISHU_AUTO_START !== "0" : DEFAULT_CONFIG.autoStart,
-    };
-  }
+  // Environment variable loading is intentionally disabled so local config stays authoritative.
+  // const envAppId = process.env.FEISHU_APP_ID?.trim();
+  // const envSecret = process.env.FEISHU_APP_SECRET?.trim();
+  // if (envAppId && envSecret) {
+  //   return {
+  //     appId: envAppId,
+  //     appSecret: envSecret,
+  //     domain: (process.env.FEISHU_DOMAIN as Domain) || DEFAULT_CONFIG.domain,
+  //     groupPolicy: (process.env.FEISHU_GROUP_POLICY as GroupPolicy) || DEFAULT_CONFIG.groupPolicy,
+  //     cardActionMode: parseCardActionMode(process.env.FEISHU_CARD_ACTION_MODE) || DEFAULT_CONFIG.cardActionMode,
+  //     cardActionWebhookHost: process.env.FEISHU_CARD_ACTION_WEBHOOK_HOST?.trim() || DEFAULT_CONFIG.cardActionWebhookHost,
+  //     cardActionWebhookPort: parsePort(process.env.FEISHU_CARD_ACTION_WEBHOOK_PORT) ?? DEFAULT_CONFIG.cardActionWebhookPort,
+  //     cardActionWebhookPath: normalizeWebhookPath(process.env.FEISHU_CARD_ACTION_WEBHOOK_PATH) || DEFAULT_CONFIG.cardActionWebhookPath,
+  //     language: (process.env.FEISHU_LANGUAGE as "zh" | "en") || DEFAULT_CONFIG.language,
+  //     reactEmoji: process.env.FEISHU_REACT_EMOJI || DEFAULT_CONFIG.reactEmoji,
+  //     autoStart: process.env.FEISHU_AUTO_START ? process.env.FEISHU_AUTO_START !== "0" : DEFAULT_CONFIG.autoStart,
+  //   };
+  // }
   if (!existsSync(CONFIG_PATH)) return undefined;
   const cfg = readJson<Partial<FeishuConfig>>(CONFIG_PATH, {});
   if (!cfg.appId || !cfg.appSecret) return undefined;

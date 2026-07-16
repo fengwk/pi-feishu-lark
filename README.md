@@ -32,7 +32,8 @@ B站：<https://space.bilibili.com/4489397>
   - `open`：群里和话题里可直接回复，不需要 @，还需手动在飞书开发者后台开启机器人“**获取群组中所有消息”的权限**
   - `mention`：只有 `@` 机器人时才回复
 - 支持图片、代码文件、文本文件等附件发送
-- 支持飞书内切换对话模型
+- 支持飞书内切换对话模型，且会尊重 Pi `settings.json` 里的 `enabledModels`
+- 支持飞书内切换思考强度（thinking level）
 - 支持显示实时 Pi 任务执行状态
 - 支持渲染显示 Markdown 格式内容
 - Pi agent 关闭后，仍有后台常驻服务可以对话，pi agent无需前台运行。
@@ -194,7 +195,8 @@ Windows PATH 加入 C:\Program Files\Git\bin
 | -------- | -------------------- |
 | `/new`   | 为当前会话新建一个 Pi 会话      |
 | `/resume` | 打开历史会话列表，切回以前的 Pi 会话 |
-| `/model` | 打开模型选择卡片，切换当前会话使用的模型 |
+| `/model` | 打开模型选择卡片，只显示当前已启用且可用的模型 |
+| `/thinking` | 打开思考强度卡片，或用 `/thinking high` 直接切换 |
 | `/stop`  | 停止当前这条回复的处理          |
 | `/workspace` | 查看当前会话绑定的工作区      |
 | `/workspace /path/to/project` | 把当前会话切换到指定工作区，下一条消息生效 |
@@ -224,23 +226,15 @@ Windows PATH 加入 C:\Program Files\Git\bin
 ~/.pi/agent/feishu/config.json
 ```
 
-也可以通过环境变量配置：
+当前版本以 `config.json` 为准，不再使用 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 等环境变量覆盖飞书配置。
 
-| 变量                    | 说明                            |
-| --------------------- | ----------------------------- |
-| `FEISHU_APP_ID`       | 飞书/Lark 应用 ID                 |
-| `FEISHU_APP_SECRET`   | 飞书/Lark 应用密钥                  |
-| `FEISHU_DOMAIN`       | `feishu` 或 `lark`，默认 `feishu` |
-| `FEISHU_GROUP_POLICY` | `open` 或 `mention`，默认 `open`  |
-| `FEISHU_LANGUAGE`     | `zh` 或 `en`                   |
-| `FEISHU_REACT_EMOJI`  | 收到消息时的表情回应，默认 `THUMBSUP`      |
-| `FEISHU_AUTO_START`   | `1` 或 `0`                     |
-| `FEISHU_CARD_ACTION_MODE` | `webhook` 或 `ws`，默认 `webhook` |
-| `FEISHU_CARD_ACTION_WEBHOOK_HOST` | 卡片回调监听地址，默认 `0.0.0.0` |
-| `FEISHU_CARD_ACTION_WEBHOOK_PORT` | 卡片回调端口，默认 `3001` |
-| `FEISHU_CARD_ACTION_WEBHOOK_PATH` | 卡片回调路径，默认 `/webhook/card` |
-| `FEISHU_EXT_DEV`      | `1` 时显示本地开发标识 `DEV`           |
+如需调整飞书连接配置，请直接编辑 `~/.pi/agent/feishu/config.json`，或在 Pi 里重新执行：
 
+```bash
+/feishu setup
+```
+
+`FEISHU_EXT_DEV=1` 仍可用于显示本地开发标识 `DEV`。
 ***
 
 ## 会保存哪些文件
@@ -259,6 +253,8 @@ Windows PATH 加入 C:\Program Files\Git\bin
 ## 常见说明
 
 - 图片能不能被识别，取决于当前选中的模型是否支持图片输入。
+- 如果你在 Pi `settings.json` 里配置了 `enabledModels`，飞书里的 `/model` 只会展示这一范围内且当前可用的模型。
+- `/thinking` 会按当前模型能力展示可选的思考强度。
 - `/feishu reset` 只会清掉配置和映射，不会删除会话历史。
 - 从 TUI、CLI 或其他渠道创建的任务，不会主动发到飞书。
 - `/workspace` 当前只支持绝对路径，或 `~/` 开头的路径。
@@ -296,7 +292,8 @@ Pi-feishu-lark is a bridge between Pi and Feishu/Lark for chat-based workflows.
 - Create a Feishu/Lark bot quickly with QR-code setup
 - Keep separate Pi sessions for DMs, group chats, and group topics
 - Support attachments such as images, code files, and text files
-- Switch models inside Feishu/Lark
+- Switch models inside Feishu/Lark while respecting Pi `enabledModels`
+- Switch thinking level inside Feishu/Lark
 - Show live Pi task status
 - Render Markdown replies
 - Keep Pi running in the background after the agent UI is closed
@@ -329,28 +326,25 @@ pi install npm:pi-feishu-lark
 | -------- | ------------------------------------------- |
 | `/new`   | Start a new Pi session for the current chat |
 | `/resume` | Open past sessions and switch back to one |
-| `/model` | Open the model picker                       |
+| `/model` | Open the model picker for enabled, available models |
+| `/thinking` | Open the thinking-level picker, or use `/thinking high` directly |
 | `/stop`  | Stop the current reply generation           |
 
 ### Config
 
-| Variable              | Meaning                |
-| --------------------- | ---------------------- |
-| `FEISHU_APP_ID`       | Feishu/Lark app ID     |
-| `FEISHU_APP_SECRET`   | Feishu/Lark app secret |
-| `FEISHU_DOMAIN`       | `feishu` or `lark`     |
-| `FEISHU_GROUP_POLICY` | `open` or `mention`    |
-| `FEISHU_LANGUAGE`     | `zh` or `en`           |
-| `FEISHU_REACT_EMOJI`  | Reaction emoji         |
-| `FEISHU_AUTO_START`   | `1` or `0`             |
-| `FEISHU_CARD_ACTION_MODE` | `webhook` or `ws`, default `webhook` |
-| `FEISHU_CARD_ACTION_WEBHOOK_HOST` | Card callback listen host, default `0.0.0.0` |
-| `FEISHU_CARD_ACTION_WEBHOOK_PORT` | Card callback port, default `3001` |
-| `FEISHU_CARD_ACTION_WEBHOOK_PATH` | Card callback path, default `/webhook/card` |
+This package now treats `~/.pi/agent/feishu/config.json` as the source of truth for Feishu configuration.
+
+It no longer overrides app credentials or bridge settings from `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and similar environment variables.
+
+If you need to change the configuration, edit `~/.pi/agent/feishu/config.json` directly or run `/feishu setup` again.
+
+`FEISHU_EXT_DEV=1` is still available to show the local `DEV` marker.
 
 ### Notes
 
 - Image understanding depends on the selected model.
+- If Pi `settings.json` defines `enabledModels`, `/model` only shows models within that enabled scope that are currently usable.
+- `/thinking` only shows thinking levels supported by the current model.
 - `/feishu reset` clears config and mappings, but keeps session history.
 - Tasks created from TUI, CLI, or other channels will not be pushed to Feishu automatically.
 - Card buttons now prefer webhook responses. If you want to keep the older WS patch flow temporarily, set `FEISHU_CARD_ACTION_MODE=ws`.

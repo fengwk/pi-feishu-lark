@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import type { AgentSession, SessionInfo } from "@earendil-works/pi-coding-agent";
@@ -8,10 +8,12 @@ import {
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { FeishuBridgeRuntime } from "./bridge-runtime.js";
 import { CHILD_SESSION_ENV, ensureRoot, readJson, STATE_PATH, writeJson } from "./config.js";
 import { debugLog } from "./debug.js";
+import { clampThinkingLevel, getSupportedThinkingLevels, isThinkingLevel, resolveEnabledModelScope, type ThinkingLevel } from "./model-preferences.js";
 import type { ResumeScope, ResumeSessionPage } from "./cards.js";
 import type { TaskStatusSink } from "./task-status-card.js";
 import type { FeishuState } from "./types.js";
@@ -44,8 +46,6 @@ export class ConversationManager {
   private readonly startingRuns = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, ActiveRun>();
   private modelRuntimePromise: Promise<ModelRuntime> | undefined;
-  private defaultProvider: string | undefined;
-  private defaultModelId: string | undefined;
   private state: FeishuState;
 
   constructor(
@@ -56,21 +56,11 @@ export class ConversationManager {
     this.state = readJson<FeishuState>(STATE_PATH, { sessions: {} });
     this.state.sessions ||= {};
     this.state.models ||= {};
+    this.state.thinking ||= {};
     this.state.workspaces ||= {};
-    this.loadSettingsDefault();
   }
-
-  /** Read global settings default model for fallback in getSelectedModel. */
-  private loadSettingsDefault() {
-    try {
-      const settingsPath = join(getAgentDir(), "settings.json");
-      const raw = readFileSync(settingsPath, "utf-8");
-      const settings = JSON.parse(raw);
-      if (settings.defaultProvider && settings.defaultModel) {
-        this.defaultProvider = settings.defaultProvider;
-        this.defaultModelId = settings.defaultModel;
-      }
-    } catch {}
+  private getSettingsManager(workspaceCwd: string) {
+    return SettingsManager.create(workspaceCwd, getAgentDir());
   }
 
   private getModelRuntime() {
@@ -80,6 +70,18 @@ export class ConversationManager {
     });
     return this.modelRuntimePromise;
   }
+
+  private async getAvailableModelChoices(key: string) {
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    const availableModels = await (await this.getModelRuntime()).getAvailable();
+    return resolveEnabledModelScope(settings.getEnabledModels(), [...availableModels]);
+  }
+
+  private getSavedThinkingLevel(key: string): ThinkingLevel | undefined {
+    const level = this.state.thinking?.[key];
+    return typeof level === "string" && isThinkingLevel(level) ? level : undefined;
+  }
+
 
   async prompt(key: string, userText: string, onReply: (text: string) => Promise<void>) {
     return this.promptWithImages(key, userText, [], onReply);
@@ -142,6 +144,9 @@ export class ConversationManager {
       try {
         debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
         const session = await this.getFreshSessionForPrompt(key);
+        const baselineMessageCount = Array.isArray(session.messages) ? session.messages.length : 0;
+        let finalStatus: "done" | "failed" = "done";
+        let finalPhase: string | undefined;
         run = {
           session,
           runId: status?.runId,
@@ -178,14 +183,40 @@ export class ConversationManager {
         }
         if (run.stopped) return;
         if (run.assistantReplyCount === 0) {
-          const answer = extractLastAssistantText(session);
-          debugLog("feishu.prompt.done", { key, answerLength: answer.length, source: "fallback" });
-          await run.fallbackReply(answer || "No response.");
+          const answer = extractAssistantTextSince(session, baselineMessageCount);
+          if (answer) {
+            debugLog("feishu.prompt.done", { key, answerLength: answer.length, source: "fallback_current_turn" });
+            await run.fallbackReply(answer);
+          } else {
+            const turnError = extractAssistantErrorSince(session, baselineMessageCount);
+            if (turnError) {
+              finalStatus = "failed";
+              finalPhase = turnError;
+              debugLog("feishu.prompt.done_error", {
+                key,
+                source: "fallback_error",
+                error: turnError,
+                baselineMessageCount,
+                totalMessageCount: Array.isArray(session.messages) ? session.messages.length : undefined,
+              });
+              await run.fallbackReply(`Pi error: ${turnError}`);
+            } else {
+              finalStatus = "failed";
+              finalPhase = "未生成最终回复";
+              debugLog("feishu.prompt.done_missing_reply", {
+                key,
+                source: "fallback_missing",
+                baselineMessageCount,
+                totalMessageCount: Array.isArray(session.messages) ? session.messages.length : undefined,
+              });
+              await run.fallbackReply("Pi 本次处理结束，但没有生成可发送的最终回复，请稍后重试。");
+            }
+          }
         } else {
           debugLog("feishu.prompt.done", { key, replyCount: run.assistantReplyCount, source: "turn_end" });
         }
         if (run.assistantReplies.length) await Promise.allSettled(run.assistantReplies);
-        await status?.finish("done");
+        await status?.finish(finalStatus, finalPhase);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         debugLog("feishu.prompt.error", { key, error: message });
@@ -328,8 +359,7 @@ export class ConversationManager {
   async selectModel(key: string, provider: string, modelId: string, onReply: (text: string) => Promise<void>) {
     const previous = this.previousTurn(key);
     const next = previous.then(async () => {
-      const availableModels = await (await this.getModelRuntime()).getAvailable();
-      const model = availableModels.find((item) => item.provider === provider && item.id === modelId);
+      const model = (await this.getAvailableModelChoices(key)).find((item) => item.model.provider === provider && item.model.id === modelId)?.model;
       if (!model) {
         await onReply(`这个模型当前不可用：${provider}/${modelId}。请发送 /model 重新选择。`);
         return;
@@ -344,6 +374,37 @@ export class ConversationManager {
       }
       this.sessions.delete(key);
       await onReply(`已切换到 ${provider}/${modelId}。当前飞书会话后续都会使用这个模型。`);
+    }).catch(async (error) => {
+      await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    this.queues.set(key, next);
+    await next;
+  }
+
+  async selectThinkingLevel(key: string, level: ThinkingLevel, onReply: (text: string) => Promise<void>) {
+    const previous = this.previousTurn(key);
+    const next = previous.then(async () => {
+      const currentModel = await this.getSelectedModel(key);
+      if (!currentModel) {
+        await onReply("当前没有可用模型。请先在 Pi 里完成模型登录或 API Key 配置。");
+        return;
+      }
+
+      const availableLevels = await this.getAvailableThinkingLevels(key);
+      if (!availableLevels.includes(level)) {
+        await onReply(`当前模型仅支持这些思考强度：${availableLevels.join("、")}。请先切换模型后再设置。`);
+        return;
+      }
+
+      this.state.thinking![key] = level;
+      writeJson(STATE_PATH, this.state);
+
+      const cached = this.sessions.get(key);
+      if (cached) {
+        try { (await cached).dispose(); } catch {}
+      }
+      this.sessions.delete(key);
+      await onReply(`已切换到 ${level} 思考强度。当前飞书会话后续都会使用这个设置。`);
     }).catch(async (error) => {
       await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -385,9 +446,8 @@ export class ConversationManager {
     await next;
   }
 
-  async getAvailableModels() {
-    const availableModels = await (await this.getModelRuntime()).getAvailable();
-    return [...availableModels].sort((a, b) => {
+  async getAvailableModels(key: string) {
+    return (await this.getAvailableModelChoices(key)).map((item) => item.model).sort((a, b) => {
       const providerCmp = a.provider.localeCompare(b.provider);
       if (providerCmp !== 0) return providerCmp;
       return a.id.localeCompare(b.id);
@@ -395,24 +455,48 @@ export class ConversationManager {
   }
 
   async getSelectedModel(key: string) {
-    const available = await this.getAvailableModels();
+    const availableChoices = await this.getAvailableModelChoices(key);
     const selected = this.state.models?.[key];
     if (selected) {
-      const model = available.find((item) => item.provider === selected.provider && item.id === selected.id);
-      if (model) return model;
+      const selectedModel = availableChoices.find((item) => item.model.provider === selected.provider && item.model.id === selected.id)?.model;
+      if (selectedModel) return selectedModel;
     }
+
     const cached = this.sessions.get(key);
     if (cached) {
       return (await cached).model;
     }
-    // Check settings default model before falling back to first available
-    if (this.defaultProvider && this.defaultModelId) {
-      const defaultModel = available.find((item) => item.provider === this.defaultProvider && item.id === this.defaultModelId);
-      if (defaultModel) {
-        return defaultModel;
-      }
+
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    const defaultProvider = settings.getDefaultProvider();
+    const defaultModelId = settings.getDefaultModel();
+    if (defaultProvider && defaultModelId) {
+      const defaultModel = availableChoices.find((item) => item.model.provider === defaultProvider && item.model.id === defaultModelId)?.model;
+      if (defaultModel) return defaultModel;
     }
-    return available[0];
+
+    return availableChoices[0]?.model;
+  }
+
+  async getAvailableThinkingLevels(key: string): Promise<ThinkingLevel[]> {
+    return getSupportedThinkingLevels(await this.getSelectedModel(key));
+  }
+
+  async getSelectedThinkingLevel(key: string): Promise<ThinkingLevel> {
+    const selected = this.getSavedThinkingLevel(key);
+    const currentModel = await this.getSelectedModel(key);
+    if (selected) {
+      return clampThinkingLevel(currentModel, selected);
+    }
+
+    const cached = this.sessions.get(key);
+    if (cached) {
+      return (await cached).thinkingLevel as ThinkingLevel;
+    }
+
+    const settings = this.getSettingsManager(this.getWorkspace(key));
+    const fallback = (settings.getDefaultThinkingLevel() || "medium") as ThinkingLevel;
+    return clampThinkingLevel(currentModel, fallback);
   }
 
   resetMemory() {
@@ -422,7 +506,7 @@ export class ConversationManager {
     this.sessions.clear();
     this.queues.clear();
     this.startingRuns.clear();
-    this.state = { sessions: {}, models: {}, workspaces: {} };
+    this.state = { sessions: {}, models: {}, thinking: {}, workspaces: {} };
   }
 
   private getSession(key: string): Promise<AgentSession> {
@@ -469,16 +553,23 @@ export class ConversationManager {
     await onReply("已追加到当前任务队列");
   }
 
-  private captureUserTurnReplyTarget(key: string) {
+  private getActiveRunForSession(key: string, sessionId: string) {
     const active = this.activeRuns.get(key);
-    if (!active || active.stopped) return;
+    if (!active || active.stopped) return undefined;
+    if (active.session.sessionId !== sessionId) return undefined;
+    return active;
+  }
+
+  private captureUserTurnReplyTarget(key: string, sessionId: string) {
+    const active = this.getActiveRunForSession(key, sessionId);
+    if (!active) return;
     const target = active.replyTargets.shift();
     if (target) active.currentTurnReplyTargets.push(target);
   }
 
-  private deliverAssistantTurnResult(key: string, message: any, _toolResults: unknown) {
-    const active = this.activeRuns.get(key);
-    if (!active || active.stopped) return;
+  private deliverAssistantTurnResult(key: string, sessionId: string, message: any, _toolResults: unknown) {
+    const active = this.getActiveRunForSession(key, sessionId);
+    if (!active) return;
     if (!isAssistantAnswerMessage(message)) return;
 
     const answer = extractAssistantText(message);
@@ -513,9 +604,21 @@ export class ConversationManager {
     const workspaceCwd = this.getWorkspace(key);
     ensureWorkspaceExists(workspaceCwd);
     const existingFile = this.state.sessions[key];
+    const settingsManager = this.getSettingsManager(workspaceCwd);
+    const enabledModels = settingsManager.getEnabledModels();
     const modelRuntime = await this.getModelRuntime();
+    const scopedModels = await this.getAvailableModelChoices(key);
     const selected = this.state.models?.[key];
-    const model = selected ? modelRuntime.getModel(selected.provider, selected.id) : undefined;
+    let model = selected
+      ? scopedModels.find((item) => item.model.provider === selected.provider && item.model.id === selected.id)?.model
+      : undefined;
+    if (!model && enabledModels?.length) {
+      const defaultProvider = settingsManager.getDefaultProvider();
+      const defaultModelId = settingsManager.getDefaultModel();
+      model = scopedModels.find((item) => item.model.provider === defaultProvider && item.model.id === defaultModelId)?.model
+        || scopedModels[0]?.model;
+    }
+    const thinkingLevel = this.getSavedThinkingLevel(key);
     const sessionManager = existingFile && existsSync(existingFile)
       ? SessionManager.open(existingFile, undefined, workspaceCwd)
       : SessionManager.create(workspaceCwd);
@@ -523,6 +626,7 @@ export class ConversationManager {
     const loader = new DefaultResourceLoader({
       cwd: workspaceCwd,
       agentDir: getAgentDir(),
+      settingsManager,
       systemPromptOverride: (base) => {
         const extra = "You are replying through Feishu/Lark. Keep answers concise and readable in chat. Do not use markdown tables.";
         return base?.trim() ? `${base}\n\n${extra}` : extra;
@@ -543,20 +647,23 @@ export class ConversationManager {
       agentDir: getAgentDir(),
       modelRuntime,
       model,
+      thinkingLevel,
+      scopedModels,
       sessionManager,
+      settingsManager,
       resourceLoader: loader,
     });
 
     await session.bindExtensions({});
     this.bridge?.attachSession(key, session.sessionId);
     session.subscribe((event) => {
-      this.activeRuns.get(key)?.status?.updateFromEvent(event);
+      this.getActiveRunForSession(key, session.sessionId)?.status?.updateFromEvent(event);
       if (event.type === "message_end") {
         this.bridge?.handleMessageEnd(session.sessionId, key, event.message);
-        if ((event.message as any)?.role === "user") this.captureUserTurnReplyTarget(key);
+        if ((event.message as any)?.role === "user") this.captureUserTurnReplyTarget(key, session.sessionId);
       }
       if (event.type === "turn_end") {
-        this.deliverAssistantTurnResult(key, (event as any).message, (event as any).toolResults);
+        this.deliverAssistantTurnResult(key, session.sessionId, (event as any).message, (event as any).toolResults);
       }
     });
 
@@ -623,12 +730,25 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
   }
 }
 
-function extractLastAssistantText(session: AgentSession): string {
-  const messages = [...(session.messages || [])].reverse();
-  for (const msg of messages as any[]) {
+function extractAssistantTextSince(session: AgentSession, startIndex: number): string {
+  const messages = Array.isArray(session.messages)
+    ? session.messages.slice(Math.max(0, startIndex))
+    : [];
+  for (const msg of [...messages].reverse() as any[]) {
     if (!isAssistantAnswerMessage(msg)) continue;
     const text = extractAssistantText(msg);
     if (text) return text;
+  }
+  return "";
+}
+
+function extractAssistantErrorSince(session: AgentSession, startIndex: number): string {
+  const messages = Array.isArray(session.messages)
+    ? session.messages.slice(Math.max(0, startIndex))
+    : [];
+  for (const msg of [...messages].reverse() as any[]) {
+    const error = extractAssistantError(msg);
+    if (error) return error;
   }
   return "";
 }
@@ -651,6 +771,22 @@ function extractAssistantText(msg: any): string {
       .trim();
   }
   return "";
+}
+
+function extractAssistantError(msg: any): string {
+  if (msg?.role !== "assistant") return "";
+  if (typeof msg.errorMessage === "string" && msg.errorMessage.trim()) return msg.errorMessage.trim();
+  if (msg.stopReason !== "error") return "";
+  const content = msg.content;
+  if (typeof content === "string" && content.trim()) return content.trim();
+  if (Array.isArray(content)) {
+    const text = content
+      .map((p) => p?.type === "text" ? p.text : "")
+      .join("")
+      .trim();
+    if (text) return text;
+  }
+  return "模型调用失败";
 }
 
 function resolveWorkspacePath(input: string) {

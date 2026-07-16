@@ -1,5 +1,6 @@
 import { detectCodeLanguage, decodeTextFile, detectImageMime, type FeishuImageInput, isSupportedImageMime, isSupportedTextFile } from "./attachments.js";
-import { buildModelCard, buildResumeCard } from "./cards.js";
+import { buildModelCard, buildResumeCard, buildThinkingCard } from "./cards.js";
+import { isThinkingLevel } from "./model-preferences.js";
 import type { ConversationManager } from "./conversation-manager.js";
 import { claimFeishuMessage, markFeishuMessage } from "./dedupe-store.js";
 import { debugLog } from "./debug.js";
@@ -126,13 +127,34 @@ export class FeishuMessageHandler {
     }
 
     if (command.name === "model") {
-      const models = await this.conversations.getAvailableModels();
+      const models = await this.conversations.getAvailableModels(key);
       if (!models.length) {
         await transport.replyText(msg.messageId, "当前没有可用模型。请先在 Pi 里完成模型登录或 API Key 配置。");
         return true;
       }
       const currentModel = await this.conversations.getSelectedModel(key);
       await transport.replyCard(msg.messageId, buildModelCard(key, models, currentModel));
+      return true;
+    }
+    if (command.name === "thinking") {
+      const currentModel = await this.conversations.getSelectedModel(key);
+      if (!currentModel) {
+        await transport.replyText(msg.messageId, "当前没有可用模型。请先在 Pi 里完成模型登录或 API Key 配置。");
+        return true;
+      }
+      if (command.level) {
+        if (!isThinkingLevel(command.level)) {
+          await transport.replyText(msg.messageId, "无效的思考强度。可选值：off、minimal、low、medium、high、xhigh。");
+          return true;
+        }
+        await this.conversations.selectThinkingLevel(key, command.level, async (reply) => {
+          await transport.replyText(msg.messageId, reply);
+        });
+        return true;
+      }
+      const levels = await this.conversations.getAvailableThinkingLevels(key);
+      const currentLevel = await this.conversations.getSelectedThinkingLevel(key);
+      await transport.replyCard(msg.messageId, buildThinkingCard(key, levels, currentLevel, currentModel));
       return true;
     }
 
